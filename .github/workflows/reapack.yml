@@ -26,7 +26,5 @@ jobs:
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          reapack-index
-          git add index.xml
-          git commit -m "Auto-update ReaPack index" || echo "No changes to commit"
+          reapack-index --commit --name "Yumyoo Toolkit"
           git push
