@@ -1,0 +1,292 @@
+desc: Yumyoo Master Key
+// tags: midi, audio, pitch, utility
+// author: Yumyoo
+// version: 1.0
+// about: A global master/slave transposition engine. Broadcasts pitch and scale changes across the entire project, manipulating both MIDI note data and real-time audio DSP seamlessly via global memory routing.
+
+options:gmem=master_key_core
+
+slider1:0<0,3,1{Master (Control Only),Slave (MIDI Transpose),Slave (Audio Transpose),Slave (Auto-Tune Bridge)}>Mode
+slider2:0<0,11,1{C, C#, D, D#, E, F, F#, G, G#, A, A#, B}>Original Root Key (Master)
+slider3:0<0,11,1{C, C#, D, D#, E, F, F#, G, G#, A, A#, B}>Target Key (Master)
+slider4:0<-2,2,1>Octave Shift (Master)
+slider5:0<0,2,1{Off,Convert Maj to Min,Convert Min to Maj}>Scale Conversion (Master)
+slider6:0<0,100,1>Humanize % (MIDI Slave)
+slider7:50<0,200,1>Window Size (Audio Slave)
+slider8:20<0.05,50,0.5>Overlap Size (Audio Slave)
+slider9:1<0,1,1{No,Yes}>Anti-Alias Filter (Audio Slave)
+slider10:0<0,11,1{C, C#, D, D#, E, F, F#, G, G#, A, A#, B}>Received Key (Auto-Tune Bridge)
+slider11:0<-2,2,1>Local Octave (Slave)
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+  ext_noinit = 1.0; 
+  memset(0, -1, 2048); 
+
+  bufsize = srate|0;
+  ext_tail_size = bufsize*2;
+  xfade=100;
+  bufloc0 = 10000; 
+  bufloc1 = bufloc0+bufsize+1000;
+
+  buffer0 = bufloc0;
+  buffer1 = bufloc1;
+  bufdiff=bufloc1-bufloc0;
+  pitch=1.0;
+  denorm=10^-20;
+
+@slider
+  mode = slider1;
+  calculated_shift = (slider3 - slider2) + (slider4 * 12);
+  
+  // Slider Visibility Logic mapped by Bitmasks
+  (mode == 0) ? (
+      slider_show(30, 1);     // Show 2, 3, 4, 5
+      slider_show(2016, 0);   // Hide 6, 7, 8, 9, 10, 11
+  );
+  
+  (mode == 1) ? (
+      slider_show(1056, 1);   // Show 6, 11
+      slider_show(990, 0);    // Hide 2, 3, 4, 5, 7, 8, 9, 10
+  );
+  
+  (mode == 2) ? (
+      slider_show(1472, 1);   // Show 7, 8, 9, 11
+      slider_show(574, 0);    // Hide 2, 3, 4, 5, 6, 10
+  );
+
+  (mode == 3) ? (
+      slider_show(512, 1);    // Show 10
+      slider_show(1534, 0);   // Hide 2, 3, 4, 5, 6, 7, 8, 9, 11
+  );
+
+  (mode == 0) ? (
+      gmem[0] = calculated_shift;
+      gmem[1] = slider3; 
+      gmem[2] = slider5; 
+      gmem[3] = slider2; 
+  );
+
+@block
+  (mode == 0) ? current_transpose = 0 : current_transpose = gmem[0];
+
+  (mode == 3) ? (
+      new_key = gmem[1];
+      (slider10 != new_key) ? (
+          slider10 = new_key;
+          sliderchange(512);    
+          slider_automate(512); 
+      );
+  );
+
+  // --- AUDIO DSP SETUP ---
+  (mode == 2) ? (
+      local_octave_shift = slider11 * 12;
+      total_audio_shift = current_transpose + local_octave_shift;
+      
+      filter = slider9 > 0.5;
+      bsnew = (min(slider7,1000)*0.001*srate)|0;
+      bsnew != bufsize ? (
+          bufsize = bsnew;
+          v0 = buffer0+bufsize*0.5;
+          v0 > bufloc0 + bufsize ? v0-=bufsize;
+      );
+
+      xfade=(slider8*0.001*srate)|0;
+      xfade>bsnew*0.5 ? xfade=bsnew*0.5;
+
+      npitch = 2^(total_audio_shift/12);
+      pitch != npitch ? (
+        pitch=npitch;
+        lppos=pitch > 1.0 ? 1.0/pitch : pitch;
+        lppos< (.1/srate) ? lppos=.1/srate;
+        r=1.0;       
+        c = 1.0 / tan($pi * lppos * 0.5);
+        a1 = 1.0 / ( 1.0 + r * c + c * c);
+        a2 = 2*a1;
+        a3 = a1;
+        b1 = 2.0 * ( 1.0 - c*c) * a1;
+        b2 = ( 1.0 - r * c + c * c) * a1;
+        h01=h02=h03=h04=0;
+        h11=h12=h13=h14=0;
+      );
+      
+      drymix = 0.0; 
+      wetmix = 1.0;
+  );
+
+  // --- MIDI ENGINE ---
+  (mode == 1) ? (
+      local_octave_shift = slider11 * 12;
+      
+      while (midirecv(offset, msg1, msg2, msg3)) ( 
+          status = msg1 & $xF0; 
+          channel = msg1 & $x0F; 
+          
+          is_note = ((status == $x90) || (status == $x80));
+          
+          is_note ? ( 
+              original_pitch = msg2;
+              original_vel = msg3;
+              
+              is_note_on = ((status == $x90) && (original_vel > 0));
+              
+              is_note_on ? ( 
+                  scale_mode = gmem[2];
+                  
+                  (scale_mode > 0) ? (
+                      orig_root = gmem[3];
+                      note_rel = (original_pitch - orig_root) % 12;
+                      (note_rel < 0) ? note_rel += 12;
+                      
+                      shift_mod = 0;
+                      
+                      (scale_mode == 1) ? (
+                          (note_rel == 4) ? shift_mod = -1;
+                          (note_rel == 9) ? shift_mod = -1;
+                          (note_rel == 11) ? shift_mod = -1;
+                      );
+                      
+                      (scale_mode == 2) ? (
+                          (note_rel == 3) ? shift_mod = 1;
+                          (note_rel == 8) ? shift_mod = 1;
+                          (note_rel == 10) ? shift_mod = 1;
+                      );
+                      
+                      new_pitch = original_pitch + current_transpose + shift_mod + local_octave_shift;
+                  ) : (
+                      new_pitch = original_pitch + current_transpose + local_octave_shift;
+                  );
+                  
+                  new_pitch = max(0, min(127, new_pitch)); 
+                  
+                  human_amt = slider6 / 100.0;
+                  
+                  (human_amt > 0) ? (
+                      b_pos = beat_position; 
+                      fraction = b_pos - floor(b_pos);
+                      
+                      is_downbeat = ((fraction < 0.1) || (fraction > 0.9));
+                      
+                      is_downbeat ? (
+                          vel_mult = 1.0 + (human_amt * 0.4);
+                          delay_samples = 0;
+                      ) : (
+                          vel_mult = 1.0 - (human_amt * 0.4);
+                          delay_ms = 15.0 * human_amt; 
+                          delay_samples = floor((delay_ms * srate) / 1000);
+                      );
+                      
+                      new_vel = min(127, max(1, floor(original_vel * vel_mult)));
+                      new_offset = offset + delay_samples;
+                      
+                      (new_offset >= samplesblock) ? new_offset = samplesblock - 1;
+
+                  ) : (
+                      new_vel = original_vel;
+                      new_offset = offset;
+                  );
+
+                  array_index = (channel * 128) + original_pitch;
+                  array_index[0] = new_pitch; 
+                  
+                  midisend(new_offset, msg1, new_pitch, new_vel); 
+              ) : (
+                  array_index = (channel * 128) + original_pitch;
+                  tracked_pitch = array_index[0]; 
+                  
+                  (tracked_pitch >= 0) ? ( 
+                      midisend(offset, msg1, tracked_pitch, msg3); 
+                      array_index[0] = -1; 
+                  ) : (
+                      midisend(offset, msg1, msg2, msg3); 
+                  );
+              );
+          ) : (
+              midisend(offset, msg1, msg2, msg3); 
+          );
+      );
+  ) : (
+      while (midirecv(offset, msg1, msg2, msg3)) ( 
+          midisend(offset, msg1, msg2, msg3);
+      );
+  );
+
+@sample
+  do_audio = ((mode == 2) && ((current_transpose != 0) || (slider11 != 0)));
+  
+  do_audio ? (
+    iv0=0|(v0); frac0=v0-iv0;
+    iv02 = iv0 >= (bufloc0+bufsize-1) ? iv0-bufsize+1 : iv0+1;   
+    
+    ren0=(iv0[0]*(1-frac0)+iv02[0]*frac0);
+    ren1=(iv0[bufdiff]*(1-frac0)+iv02[bufdiff]*frac0);
+    vr=pitch;
+
+    vr >= 1.0 ?
+    (
+      tv=v0;
+      tv>buffer0?tv-=bufsize;
+      (tv >= buffer0-xfade && tv < buffer0) ? (
+        frac=(buffer0-tv)/xfade;
+        tmp=v0+xfade;
+        tmp>=bufloc0+bufsize?tmp-=bufsize;
+        tmp2=tmp>=bufloc0+bufsize-1?bufloc0:tmp+1;
+        ren0 = ren0*frac + (1-frac)*( tmp[0]*(1-frac0)+tmp2[0]*frac0 );
+        ren1 = ren1*frac + (1-frac)*( tmp[bufdiff]*(1-frac0)+tmp2[bufdiff]*frac0 );
+        tv+vr > buffer0+1 ? v0+=xfade;
+      );
+    ) : ( 
+      tv=v0;
+      tv<buffer0?tv+=bufsize;
+      (tv >= buffer0 && tv < buffer0+xfade) ? (
+        frac=(tv-buffer0)/xfade;
+        tmp=v0+xfade;
+        tmp>=bufloc0+bufsize?tmp-=bufsize;
+        tmp2=tmp>=bufloc0+bufsize-1?bufloc0:tmp+1;
+        ren0 = ren0*frac + (1-frac)*( tmp[0]*(1-frac0)+tmp2[0]*frac0 );
+        ren1 = ren1*frac + (1-frac)*( tmp[bufdiff]*(1-frac0)+tmp2[bufdiff]*frac0 );
+        tv+vr < buffer0+1 ? v0+=xfade;
+      );
+    );
+      
+    ((v0+=vr) >= (bufloc0+bufsize)) ? v0 -= bufsize;
+
+    os0=spl0; os1=spl1;
+    filter && pitch>1.0?
+    (
+      t0=spl0; t1=spl1;
+      spl0=a1*spl0 + a2*h01 + a3*h02 - b1*h03 - b2*h04 + denorm;
+      spl1=a1*spl1 + a2*h11 + a3*h12 - b1*h13 - b2*h14 + denorm;
+      h02=h01; h01=t0;
+      h12=h11; h11=t1;
+      h04=h03; h03=spl0;
+      h14=h13; h13=spl1;
+    );
+
+    buffer0[0] = spl0; 
+    buffer0[bufdiff] = spl1;
+
+    spl0 = ren0 * wetmix;
+    spl1 = ren1 * wetmix;
+
+    filter && pitch<1.0?
+    (
+      t0=spl0; t1=spl1;
+      spl0=a1*spl0 + a2*h01 + a3*h02 - b1*h03 - b2*h04 + denorm;
+      spl1=a1*spl1 + a2*h11 + a3*h12 - b1*h13 - b2*h14 + denorm;
+      h02=h01; h01=t0;
+      h12=h11; h11=t1;
+      h04=h03; h03=spl0;
+      h14=h13; h13=spl1;
+    );
+
+    spl0+=os0*drymix;
+    spl1+=os1*drymix;
+
+    ((buffer0+=1) >= (bufloc0 + bufsize)) ? buffer0 -= bufsize;
+  );

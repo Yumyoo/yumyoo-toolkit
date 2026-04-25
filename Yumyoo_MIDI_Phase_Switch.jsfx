@@ -1,0 +1,40 @@
+desc: Yumyoo MIDI Phase Switch
+// tags: utility, phase, midi
+// author: Yumyoo
+// version: 1.0
+// about: Inverts audio polarity in real-time when triggered by MIDI Channel 2 notes. Features a mathematical smoothing engine to prevent zero-crossing audio pops.
+
+slider1:5<0,50,1>Smoothing Engine (ms)
+
+@init
+target_mult = 1;
+current_mult = 1;
+
+@slider
+smooth_sec = slider1 / 1000;
+alpha = 1 - exp(-1 / (smooth_sec * srate));
+
+@block
+while (midirecv(offset, msg1, msg2, msg3)) (
+    status = msg1 & 240;
+    channel = msg1 & 15; 
+    velocity = msg3;
+
+    // Note On detection (Status 144)
+    status == 144 && velocity > 0 ? (
+        // Channel 2 (Index 1) triggers inversion (-1 multiplier)
+        // All other channels default to normal phase (1 multiplier)
+        channel == 1 ? target_mult = -1 : target_mult = 1;
+    );
+    
+    // Pass all MIDI data through untouched to the synth/sampler
+    midisend(offset, msg1, msg2, msg3); 
+);
+
+@sample
+// Smooth the multiplier transition to prevent zero-crossing pops
+current_mult += (target_mult - current_mult) * alpha;
+
+// Apply mathematical polarity to Left and Right audio channels
+spl0 *= current_mult;
+spl1 *= current_mult;
